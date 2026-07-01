@@ -7,7 +7,7 @@ OMS Carousel Render Server v3
 
 from flask import Flask, request, jsonify, send_file, url_for
 from PIL import Image, ImageDraw, ImageFont
-import json, os, io, zipfile, textwrap, re, urllib.request, uuid, time, threading
+import json, os, io, zipfile, textwrap, re, urllib.request, uuid, time, threading, sys
 
 app = Flask(__name__)
 
@@ -30,6 +30,10 @@ BAR      = 8
 
 # ── Шрифти ───────────────────────────────────────────────
 FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
+
+def log(msg):
+    """Проста функція логування, яка одразу вилітає в Railway Deploy Logs"""
+    print(f"[LOG] {msg}", flush=True)
 
 def load_font(name, size):
     paths = {
@@ -71,7 +75,8 @@ def fetch_image(url):
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=10) as r:
             return Image.open(io.BytesIO(r.read())).convert("RGBA")
-    except Exception:
+    except Exception as e:
+        log(f"fetch_image FAILED for {url}: {e}")
         return None
 
 def make_gradient(size, start_alpha=80, end_alpha=240):
@@ -263,11 +268,14 @@ threading.Thread(target=cleanup_old_sessions, daemon=True).start()
 @app.route("/render", methods=["POST"])
 def render():
     try:
-        data = parse_json(request.get_data(as_text=True))
+        raw_body = request.get_data(as_text=True)
+        data = parse_json(raw_body)
     except Exception as e:
+        log(f"/render JSON parse error: {e}")
         return jsonify({"error": f"JSON parse error: {e}"}), 400
 
     slides = data.get("slides", [])
+    log(f"/render received {len(slides)} slides")
     if not slides:
         return jsonify({"error": "No slides provided"}), 400
 
@@ -292,13 +300,28 @@ def render():
 @app.route("/render_urls", methods=["POST"])
 def render_urls():
     try:
-        data = parse_json(request.get_data(as_text=True))
+        raw_body = request.get_data(as_text=True)
+        log(f"/render_urls raw body length: {len(raw_body)} chars")
+        data = parse_json(raw_body)
     except Exception as e:
+        log(f"/render_urls JSON parse error: {e}")
         return jsonify({"error": f"JSON parse error: {e}"}), 400
 
     slides = data.get("slides", [])
+    log(f"/render_urls received {len(slides)} slides")
+
     if not slides:
-        return jsonify({"error": "No slides provided"}), 400
+        log("/render_urls: 'slides' key missing or empty in payload")
+        return jsonify({"error": "No slides provided", "received_keys": list(data.keys())}), 400
+
+    if len(slides) < 2:
+        # Instagram Carousel вимагає мінімум 2 фото — краще впасти тут
+        # з чіткою помилкою, ніж мовчки віддати неповний масив у Make.
+        log(f"/render_urls: only {len(slides)} slide(s) received, Instagram carousel needs >=2")
+        return jsonify({
+            "error": f"Only {len(slides)} slide(s) in payload, Instagram carousel requires at least 2",
+            "slides_count": len(slides)
+        }), 400
 
     # Унікальна сесія для цього запиту
     session_id = str(uuid.uuid4())
@@ -308,14 +331,31 @@ def render_urls():
     total = len(slides)
     urls = []
     base_url = request.host_url.rstrip("/")
+    # Railway ставить сервіс за проксі — переконуємось, що схема https,
+    # навіть якщо Flask всередині бачить http (інакше Instagram може
+    # відмовитись від "небезпечних" http-посилань).
+    if base_url.startswith("http://"):
+        base_url = "https://" + base_url[len("http://"):]
 
     for slide in slides:
-        img = render_slide(slide, total)
-        filename = f"slide_{slide.get('n', 0):02d}.png"
-        filepath = os.path.join(session_dir, filename)
-        img.save(filepath, format="PNG", optimize=True)
-        url = f"{base_url}/slides/{session_id}/{filename}"
-        urls.append(url)
+        try:
+            img = render_slide(slide, total)
+            filename = f"slide_{slide.get('n', 0):02d}.png"
+            filepath = os.path.join(session_dir, filename)
+            img.save(filepath, format="PNG", optimize=True)
+            url = f"{base_url}/slides/{session_id}/{filename}"
+            urls.append(url)
+        except Exception as e:
+            log(f"/render_urls: failed to render slide {slide.get('n', '?')}: {e}")
+            # не додаємо URL, який не існує — але продовжуємо інші слайди
+
+    log(f"/render_urls: successfully rendered {len(urls)}/{total} slides for session {session_id}")
+
+    if len(urls) < 2:
+        return jsonify({
+            "error": f"Only {len(urls)} slide(s) rendered successfully out of {total}",
+            "session_id": session_id
+        }), 500
 
     return jsonify({
         "session_id": session_id,
